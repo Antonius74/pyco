@@ -1,8 +1,8 @@
 import json
 import logging
-import time
-import threading
 import re
+import threading
+import time
 from typing import Any
 
 from prompt_toolkit import Application
@@ -12,62 +12,53 @@ from prompt_toolkit.layout import HSplit, VSplit, Window, Layout
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.layout.dimension import D
 from prompt_toolkit.styles import Style
-from prompt_toolkit.formatted_text import FormattedText as PTFormattedText
 
 from ollama_client import OllamaClient
 from plugins import all_plugins, list_plugins
 from config import load_config
 
+logging.getLogger("prompt_toolkit").setLevel(logging.CRITICAL)
 logger = logging.getLogger("pyagent.tui")
 
-THEME = Style.from_dict({
-    "bg": "bg:#0b0e14 #cdd6f4",
-    "header": "bg:#0b0e14 #89b4fa bold",
-    "user-bubble": "bg:#1e1e2e #89b4fa bold",
-    "agent": "#cdd6f4",
-    "agent-dim": "#6c7086 italic",
-    "tool-name": "bg:#1e1e2e #f9e2af bold",
-    "tool-args": "#585b70 italic",
-    "tool-out": "bg:#111118 #a6e3a1",
-    "tool-err-label": "#f38ba8 bold",
-    "error": "#f38ba8 bold",
-    "success": "#a6e3a1",
-    "thinking": "#6c7086 italic",
-    "divider": "#313244",
-    "input-area": "bg:#0b0e14",
-    "input-prompt": "#89dceb bold",
-    "input-model-badge": "bg:#1e1e2e #f5c2e7 bold",
-    "status-bar": "bg:#1e1e2e #585b70",
-    "status-spinner": "#f9e2af",
-    "status-model": "#89b4fa bold",
-    "status-count": "#a6e3a1",
+STYLE = Style.from_dict({
+    "root":            "bg:#0a0c10 #c6cdd4",
+    "logo":            "bg:#0a0c10 #89b4fa bold",
+    "user":            "bg:#0a0c10 #aac4ff",
+    "agent":           "bg:#0a0c10 #c6cdd4",
+    "agent-dim":       "bg:#0a0c10 #5c6370 italic",
+    "thinking":        "bg:#0a0c10 #5c6370 italic",
+    "tool-tag":        "bg:#11131a #f2cd7f bold",
+    "tool-args":       "bg:#0a0c10 #6c7086 italic",
+    "tool-out":        "bg:#0a0c10 #a6e3a1",
+    "tool-err":        "bg:#0a0c10 #f38ba8",
+    "error":           "bg:#0a0c10 #f38ba8 bold",
+    "success":         "bg:#0a0c10 #a6e3a1 bold",
+    "divider":         "bg:#0a0c10 #2a2e3a",
+    "input-area":      "bg:#11131a",
+    "input-prompt":    "bg:#11131a #89b4fa bold",
+    "input-model-badge": "bg:#1e2230 #f2cde7 bold",
+    "status-bar":      "bg:#11131a #5c6370",
+    "status-spin":     "bg:#11131a #f2cd7f",
+    "status-model":    "bg:#11131a #89b4fa bold",
+    "status-hint":     "bg:#11131a #45475a italic",
 })
-TOOL_RESULT_MAX = 6000
-DIV_WIDTH = 50
+
+TOOL_MAX = 6000
+DIV = "─" * 60
+SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+WELCOME = """\
+  █████╗  █████╗   █████╗
+  ██╔══╝  ██╔══╝   ██╔══╝
+  █████╗  ██║      ██║
+  ╚═══██╗ ██║      ██║
+  █████╔╝ ███████╗ ███████╗
+  ╚════╝  ╚══════╝ ╚══════╝
+"""
 
 
-def _fmt_token(tok: dict) -> str:
-    fn = tok.get("function", {})
-    name = fn.get("name", "")
-    args = fn.get("arguments", {})
-    if isinstance(args, str):
-        try:
-            args = json.loads(args)
-        except json.JSONDecodeError:
-            pass
-    if isinstance(args, dict):
-        bits = ", ".join(f"{k}={v!r}" for k, v in args.items())
-    else:
-        bits = str(args)
-    return f"{name}({bits})"
-
-
-class _ChatLine:
+class _Msg:
     __slots__ = ("style", "text")
-
-    def __init__(self, style: str, text: str):
-        self.style = style
-        self.text = text
+    def __init__(self, s: str, t: str): self.style = s; self.text = t
 
 
 class PyAgentTUI:
@@ -75,362 +66,317 @@ class PyAgentTUI:
         cfg = load_config()
         self.client = OllamaClient(model=model)
         self.client.model = model or cfg.model
-        self.system_prompt = cfg.system_prompt
-        self.max_iterations = cfg.max_tool_iterations
+        self.system = cfg.system_prompt
+        self.max_it = cfg.max_tool_iterations
 
-        self._lock = threading.Lock()
-        self._lines: list[_ChatLine] = []
-        self.streaming = False
-        self.interrupted = False
-        self.tool_calls_total = 0
-        self.start_time = 0.0
+        self._lk = threading.Lock()
+        self._msgs: list[_Msg] = []
+        self._streaming = False
+        self._interrupt = False
+        self._tc_total = 0
+        self._t0 = 0.0
+        self._spin_i = 0
+        self._spin_t = 0.0
 
-        self._model_str = f" {self.client.model} "
-        self._status_str = ""
-        self._spinner_idx = 0
-        self._spinner_frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-        self._last_spinner = 0.0
+        self._model_label = f" {self.client.model} "
 
-        self.output_control = FormattedTextControl(
-            text=self._render_output, focusable=False
-        )
+        self._out_ctrl = FormattedTextControl(self._render, focusable=False)
 
-        self.input_buffer = Buffer(multiline=True)
-        input_ctrl = BufferControl(buffer=self.input_buffer)
+        self._in_buf = Buffer(multiline=True)
+        in_ctrl = BufferControl(buffer=self._in_buf)
 
-        prompt_lbl = Window(
+        prompt_icon = Window(
             content=FormattedTextControl([("class:input-prompt", " ⬢ ")]),
             width=3,
-            style="class:bg",
+            style="class:input-area",
         )
 
         model_badge = Window(
             content=FormattedTextControl(
-                lambda: [("class:input-model-badge", self._model_str)]),
-            style="class:bg",
+                lambda: [("class:input-model-badge", self._model_label)]
+            ),
             width=len(self.client.model) + 4,
+            style="class:input-area",
             height=1,
         )
 
-        input_row = VSplit(
-            [
-                prompt_lbl,
-                Window(content=input_ctrl, wrap_lines=True),
-                model_badge,
-            ],
-            style="class:bg",
-            height=D(min=1, max=8),
-        )
+        input_row = VSplit([
+            prompt_icon,
+            Window(content=in_ctrl, wrap_lines=True),
+            model_badge,
+        ], style="class:input-area", height=D(min=1, max=8))
 
-        self.status_ctrl = FormattedTextControl(
-            lambda: self._build_status_line()
-        )
-        status_bar = Window(
-            content=self.status_ctrl, height=1, style="class:status-bar"
-        )
+        self._status_ctrl = FormattedTextControl(self._status_line)
+        status = Window(content=self._status_ctrl, height=1, style="class:status-bar")
 
-        out = Window(
-            content=self.output_control, wrap_lines=False, always_hide_cursor=True
-        )
+        out = Window(content=self._out_ctrl, wrap_lines=False, always_hide_cursor=True)
 
-        root = HSplit(
-            [
-                Window(height=1, char=" ", style="class:bg"),
-                out,
-                Window(height=1, char="▔", style="class:divider"),
-                input_row,
-                status_bar,
-            ]
-        )
+        root = HSplit([
+            out,
+            Window(height=1, char="▔", style="class:divider"),
+            input_row,
+            status,
+        ])
 
-        self.kb = self._make_kb()
+        self.kb = self._bind_keys()
         self.app = Application(
             layout=Layout(root, focused_element=input_row),
             key_bindings=self.kb,
-            style=THEME,
+            style=STYLE,
             full_screen=True,
             mouse_support=True,
             refresh_interval=0.08,
         )
 
-        self._lines.append(_ChatLine("agent-dim", "\n  PyCo v0.2 — coding agent in Python"))
-        self._lines.append(_ChatLine("agent-dim", "  /help per i comandi"))
+        self._put("logo", WELCOME)
+        self._put("agent-dim", "  /help per i comandi  |  ctrl+d per uscire")
 
-    def _make_kb(self) -> KeyBindings:
+    # ── keys ────────────────────────────────────────────────────────
+
+    def _bind_keys(self) -> KeyBindings:
         kb = KeyBindings()
 
         @kb.add("escape", "enter")
         def _(event):
-            self.input_buffer.insert_text("\n")
+            self._in_buf.insert_text("\n")
 
         @kb.add("c-j")
-        def _(event):
-            text = self.input_buffer.text.rstrip("\n")
-            if not text.strip():
-                return
-            self.input_buffer.reset()
-            self._dispatch(text.strip())
-
         @kb.add("enter")
         def _(event):
-            text = self.input_buffer.text.rstrip("\n")
-            if not text.strip():
+            t = self._in_buf.text.rstrip("\n")
+            if not t.strip():
                 return
-            self.input_buffer.reset()
-            self._dispatch(text.strip())
+            self._in_buf.reset()
+            self._dispatch(t.strip())
 
         @kb.add("c-c")
         def _(event):
-            if self.streaming:
-                self.interrupted = True
-                self._push("error", "\n[interrotto]")
+            if self._streaming:
+                self._interrupt = True
+                self._put("error", "\n  ⏹ interrotto")
             else:
                 event.app.exit()
 
         @kb.add("c-d")
         def _(event):
-            if not self.input_buffer.text:
+            if not self._in_buf.text:
                 event.app.exit()
-
-        @kb.add("pageup")
-        def _(event):
-            pass
-
-        @kb.add("pagedown")
-        def _(event):
-            pass
 
         return kb
 
-    def _push(self, style: str, text: str):
-        with self._lock:
-            self._lines.append(_ChatLine(style, text))
+    # ── output ──────────────────────────────────────────────────────
+
+    def _put(self, style: str, text: str):
+        with self._lk:
+            self._msgs.append(_Msg(style, text))
         self.app.invalidate()
 
-    def _push_append(self, style: str, text: str):
-        with self._lock:
-            if self._lines and self._lines[-1].style == style:
-                self._lines[-1].text += text
+    def _append(self, style: str, text: str):
+        with self._lk:
+            if self._msgs and self._msgs[-1].style == style:
+                self._msgs[-1].text += text
             else:
-                self._lines.append(_ChatLine(style, text))
+                self._msgs.append(_Msg(style, text))
         self.app.invalidate()
 
-    def _render_output(self):
+    def _render(self):
         parts = []
-        with self._lock:
-            for line in self._lines:
-                parts.append(("class:" + line.style, line.text))
+        with self._lk:
+            for m in self._msgs:
+                parts.append(("class:" + m.style, m.text))
                 parts.append(("", "\n"))
-        return PTFormattedText(parts)
+        return parts
 
-    def _build_status_line(self):
+    def _status_line(self):
         now = time.monotonic()
-        if self.streaming:
-            if now - self._last_spinner > 0.08:
-                self._spinner_idx = (self._spinner_idx + 1) % len(self._spinner_frames)
-                self._last_spinner = now
-            spin = self._spinner_frames[self._spinner_idx]
-            elapsed = now - self.start_time if self.start_time else 0
-            tc = f"{self.tool_calls_total} tool" if self.tool_calls_total else ""
+        if self._streaming:
+            if now - self._spin_t > 0.08:
+                self._spin_i = (self._spin_i + 1) % len(SPIN)
+                self._spin_t = now
+            elapsed = f" {now - self._t0:.1f}s" if self._t0 else ""
+            tc = f" {self._tc_total} tool calls" if self._tc_total else ""
             return [
-                ("class:status-spinner", f" {spin} "),
-                ("", "Generando"),
-                ("class:status-count", f"  {tc}" if tc else " "),
-                ("", f"  {elapsed:.1f}s" if elapsed > 0.5 else ""),
-                ("", "  Esc per interrompere"),
+                ("class:status-spin", f" {SPIN[self._spin_i]} "),
+                ("", "Generating"),
+                ("", tc),
+                ("", elapsed),
+                ("", "  "),
+                ("class:status-hint", "esc interrompi"),
             ]
         return [
-            ("", " tab agent · ctrl+k comandi · ctrl+d esci"),
-            ("class:status-model", f"  {self.client.model}"),
+            ("class:status-hint", " ctrl+j invia  esc+enter multilinea  ctrl+c esci"),
+            ("", "  "),
+            ("class:status-model", self._model_label.strip()),
         ]
+
+    # ── dispatch ────────────────────────────────────────────────────
 
     def _dispatch(self, text: str):
         if text.startswith("/"):
-            parts = text.split(maxsplit=1)
-            cmd = parts[0].lower()
-            arg = parts[1] if len(parts) > 1 else ""
-            self._cmd(cmd, arg)
+            p = text.split(maxsplit=1)
+            self._cmd(p[0].lower(), p[1] if len(p) > 1 else "")
         else:
-            self._run(text)
+            self._agent(text)
 
     def _cmd(self, cmd: str, arg: str):
         if cmd == "/exit":
             self.app.exit()
         elif cmd == "/clear":
-            with self._lock:
-                self._lines.clear()
-            self._push("agent-dim", "\n  PyCo v0.2")
-            self._push("agent-dim", "  Conversazione pulita.")
-            self.tool_calls_total = 0
-            self.start_time = 0
+            with self._lk:
+                self._msgs.clear()
+            self._put("logo", WELCOME)
+            self._put("agent-dim", "  conversazione pulita")
+            self._tc_total = 0
+            self._t0 = 0
         elif cmd == "/models":
-            self._push("agent-dim", "\n  Modelli disponibili:")
+            self._put("divider", f"\n{DIV}")
+            self._put("tool-tag", "  ▸ /models")
             for m in self.client.list_models():
-                mark = " ●" if m == self.client.model else ""
-                self._push("status-count" if mark.strip() else "agent-dim", f"    {m}{mark}")
+                cur = " ●" if m == self.client.model else ""
+                self._put("tool-out", f"     {m}{cur}")
+            self._put("divider", DIV)
         elif cmd == "/plugins":
-            self._push("agent-dim", "\n  Plugin:")
+            self._put("divider", f"\n{DIV}")
+            self._put("tool-tag", "  ▸ /plugins")
             for p in list_plugins():
-                self._push("tool-name", f"    ▸ {p.tool_name}")
-                self._push("agent-dim", f"      {p.description}")
+                self._put("tool-out", f"    {p.tool_name}")
+                self._put("agent-dim", f"      {p.description}")
+            self._put("divider", DIV)
         elif cmd.startswith("/model"):
             if arg:
                 self.client.model = arg
-                self._model_str = f" {arg} "
-                self._push("success", f"\n  → modello: {arg}")
+                self._model_label = f" {arg} "
+                self._put("success", f"\n  → modello: {arg}")
             else:
-                self._push("agent-dim", f"\n  Modello: {self.client.model}")
+                self._put("agent-dim", f"\n  modello: {self.client.model}")
         elif cmd == "/help":
-            self._push("agent-dim", """\n
-  ⌨  Comandi
-  ──────────
-  /exit           Esci
-  /clear          Pulisci conversazione
-  /models         Modelli Ollama
-  /model <nome>   Cambia modello
-  /plugins        Plugin disponibili
-  /help           Questo aiuto
-  Ctrl+Enter      Nuova riga
-  Ctrl+C          Interrompi / esci
-  Ctrl+D          Esci""")
+            self._put("agent", """\n\
+  comandi
+  ───────
+  /exit           uscire
+  /clear          pulire conversazione
+  /models         modelli ollama
+  /model <nome>   cambiare modello
+  /plugins        plugin disponibili
+  /help           questo aiuto
+  ctrl+enter      nuova riga
+  ctrl+c          interrompere / uscire
+  ctrl+d          uscire""")
         else:
-            self._push("error", f"\n  Comando sconosciuto: {cmd}")
+            self._put("error", f"\n  comando sconosciuto: {cmd}")
 
-    def _run(self, text: str):
-        if self.streaming:
+    # ── agent loop ──────────────────────────────────────────────────
+
+    def _agent(self, text: str):
+        if self._streaming:
             return
 
-        self.streaming = True
-        self.interrupted = False
-        self.tool_calls_total = 0
-        self.start_time = time.monotonic()
+        self._streaming = True
+        self._interrupt = False
+        self._tc_total = 0
+        self._t0 = time.monotonic()
 
-        self._push("user-bubble", f"\n▌ {text}")
+        self._put("user", f"\n▌ {text}")
 
         tools = [p.get_tool_schema() for p in all_plugins()]
-        messages: list[dict] = [{"role": "user", "content": text}]
-        first_content = True
+        msgs: list[dict] = [{"role": "user", "content": text}]
 
         try:
-            for _ in range(self.max_iterations):
-                if self.interrupted:
+            for _ in range(self.max_it):
+                if self._interrupt:
                     break
 
-                response_text, tool_calls = self._stream_one(
-                    messages, tools, self.system_prompt
-                )
+                resp_text, tcs = self._stream_msgs(msgs, tools, self.system)
 
-                if self.interrupted:
+                if self._interrupt:
                     break
 
-                if not tool_calls:
-                    if not response_text.strip() and self.tool_calls_total > 0:
-                        self._push("agent", "\n  ✅ fatto")
+                if not tcs:
                     break
 
-                for tc in tool_calls:
+                for tc in tcs:
                     fn = tc.get("function", {})
                     name = fn.get("name", "")
                     args = fn.get("arguments", {})
-
                     if isinstance(args, str):
                         try:
                             args = json.loads(args)
                         except json.JSONDecodeError:
                             args = {}
 
-                    self._push("tool-name", f"\n  ▸ {name}")
-                    args_str = ", ".join(
-                        f"{k}={json.dumps(v, ensure_ascii=False)}"
-                        for k, v in args.items()
-                    )
-                    self._push("tool-args", f"     {args_str}")
+                    arg_str = ", ".join(f"{k}={json.dumps(v, ensure_ascii=False)}" for k, v in args.items())
+                    self._put("tool-tag", f"\n  ▸ {name}")
+                    if arg_str:
+                        self._put("tool-args", f"     {arg_str}")
 
                     from plugins import get_plugin
-
-                    plugin = get_plugin(name)
-                    if plugin:
+                    pl = get_plugin(name)
+                    if pl:
                         try:
-                            result = str(plugin.execute(**args))
-                            self.tool_calls_total += 1
+                            out = str(pl.execute(**args))
+                            self._tc_total += 1
                         except Exception as e:
-                            result = f"ERR: {e}"
-                            self._push("tool-err-label", f"     {result[:200]}")
+                            out = f"exception: {e}"
+                            self._put("tool-err", f"     ERR: {e}")
                             continue
 
-                        preview = result.rstrip()[:600]
-                        if len(result) > 600:
-                            preview += f"\n     (... {len(result)} caratteri totali)"
-                        self._push("tool-out", f"     │ {preview.replace(chr(10), chr(10)+'     │ ')}")
+                        for line in out.rstrip().split("\n")[:40]:
+                            self._put("tool-out", f"     │ {line}")
 
-                        assistant_msg = {
+                        am = {
                             "role": "assistant",
-                            "content": response_text,
+                            "content": resp_text,
                             "tool_calls": [dict(tc)],
                         }
-                        messages.append(assistant_msg)
-                        messages.append({
-                            "role": "tool",
-                            "content": result[:TOOL_RESULT_MAX],
-                        })
+                        msgs.append(am)
+                        msgs.append({"role": "tool", "content": out[:TOOL_MAX]})
                     else:
-                        self._push("error", f"     tool '{name}' non trovato")
-                        messages.append({
-                            "role": "tool",
-                            "content": f"Tool '{name}' non disponibile.",
-                        })
+                        self._put("tool-err", f"     tool '{name}' non trovato")
+                        msgs.append({"role": "tool", "content": f"Tool '{name}' non disponibile."})
 
-            self._push("divider", f"\n{'—' * DIV_WIDTH}")
+            self._put("divider", f"\n{DIV}")
 
         except Exception as e:
-            self._push("error", f"\n  ✗ {e}")
+            self._put("error", f"\n  ✗ {e}")
 
-        self.streaming = False
-        self.interrupted = False
+        self._streaming = False
+        self._interrupt = False
 
-    def _stream_one(
-        self, messages: list[dict], tools: list[dict], system: str
-    ) -> tuple[str, list[dict]]:
+    # ── stream ──────────────────────────────────────────────────────
+
+    def _stream_msgs(self, msgs: list, tools: list, system: str):
         full = ""
-        tcm: dict[int, dict] = {}
-        first = True
+        tmap: dict[int, dict] = {}
+        started = False
 
         try:
-            for chunk in self.client.chat_stream(messages, tools, system):
-                if self.interrupted:
+            for ch in self.client.chat_stream(msgs, tools, system):
+                if self._interrupt:
                     break
-
-                msg = chunk.get("message", {})
+                msg = ch.get("message", {})
                 delta = msg.get("content", "")
                 if delta:
                     full += delta
-                    if first:
-                        self._push("agent", delta)
-                        first = False
-                    else:
-                        self._push_append("agent", delta)
+                    self._append("agent", delta)
 
                 for tc in msg.get("tool_calls") or []:
                     idx = tc.get("index", 0)
-                    if idx not in tcm:
-                        tcm[idx] = {"function": {"name": "", "arguments": ""}}
+                    if idx not in tmap:
+                        tmap[idx] = {"function": {"name": "", "arguments": ""}}
                     f = tc.get("function", {})
                     if f.get("name"):
-                        tcm[idx]["function"]["name"] += f["name"]
+                        tmap[idx]["function"]["name"] += f["name"]
                     if "arguments" in f:
                         v = f["arguments"]
-                        tcm[idx]["function"]["arguments"] += (
-                            v if isinstance(v, str) else json.dumps(v)
-                        )
-
-                if chunk.get("done"):
+                        tmap[idx]["function"]["arguments"] += (v if isinstance(v, str) else json.dumps(v))
+                if ch.get("done"):
                     break
         except Exception as e:
-            raise Exception(f"Ollama → {e}")
+            raise Exception(f"ollama: {e}")
 
         out = []
-        for idx in sorted(tcm):
-            tc = tcm[idx]
+        for idx in sorted(tmap):
+            tc = tmap[idx]
             a = tc["function"].get("arguments", "")
             try:
                 tc["function"]["arguments"] = json.loads(a) if a.strip() else {}
@@ -445,11 +391,11 @@ class PyAgentTUI:
 
 def main():
     import argparse
-    p = argparse.ArgumentParser()
-    p.add_argument("--model", "-m", help="Modello Ollama")
-    p.add_argument("prompt", nargs="*")
-    p.add_argument("--no-tools", action="store_true")
-    args = p.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", "-m", help="modello ollama")
+    ap.add_argument("prompt", nargs="*")
+    ap.add_argument("--no-tools", action="store_true")
+    a = ap.parse_args()
 
     from config import ensure_dirs
     from plugins import discover_plugins
@@ -457,14 +403,13 @@ def main():
     ensure_dirs()
     discover_plugins(_plugins)
 
-    if args.prompt:
+    if a.prompt:
         from agent import Agent
-        agent = Agent(OllamaClient(model=args.model) if args.model else None)
-        result = agent.run(" ".join(args.prompt), tools_enabled=not args.no_tools)
-        print(result.answer)
+        ag = Agent(OllamaClient(model=a.model) if a.model else None)
+        r = ag.run(" ".join(a.prompt), tools_enabled=not a.no_tools)
+        print(r.answer)
         return
-
-    PyAgentTUI(model=args.model).run()
+    PyAgentTUI(model=a.model).run()
 
 
 if __name__ == "__main__":
