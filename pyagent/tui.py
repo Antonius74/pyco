@@ -7,7 +7,7 @@ from prompt_toolkit import Application
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.completion import WordCompleter
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import HSplit, VSplit, Window
+from prompt_toolkit.layout import HSplit, VSplit, Window, Layout
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.layout.dimension import D
 from prompt_toolkit.styles import Style
@@ -143,7 +143,7 @@ class PyAgentTUI:
         root = HSplit([header, output_area, divider, input_area, status])
 
         return Application(
-            layout=root,
+            layout=Layout(root, focused_element=input_area),
             key_bindings=self.kb,
             style=STYLE,
             full_screen=True,
