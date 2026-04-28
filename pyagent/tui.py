@@ -171,7 +171,7 @@ class PyAgentTUI:
         parts = []
         with self._lock:
             for style, text in self.output_lines:
-                parts.append((style, text))
+                parts.append(("class:" + style, text))
                 parts.append(("", "\n"))
         return parts
 
